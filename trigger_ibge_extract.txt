@@ -1,1 +1,2 @@
 Temporary trigger for the official IBGE PPM extraction used in the GO–MT–MS market analysis.
+Retry after adding GZIP response handling.
