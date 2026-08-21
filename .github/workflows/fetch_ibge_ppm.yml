@@ -7,13 +7,16 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   fetch:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Checkout temporary repository
+        uses: actions/checkout@v4
+
       - name: Fetch and normalize official IBGE PPM data
         shell: bash
         run: |
@@ -21,7 +24,6 @@ jobs:
           import csv
           import json
           import time
-          import urllib.parse
           import urllib.request
           from pathlib import Path
 
@@ -62,7 +64,6 @@ jobs:
                       loc = item.get("localidade", {})
                       loc_id = str(loc.get("id", ""))
                       loc_name = loc.get("nome", "")
-                      # Municipality results only; safeguard against aggregate rows.
                       if not loc_id or len(loc_id) < 6:
                           continue
                       clean_name = loc_name.rsplit(" - ", 1)[0]
@@ -106,14 +107,12 @@ jobs:
                   long_rows.extend(extracted)
                   raw_manifest.append({"uf": UFS[uf_code], "metric": metric, "url": url, "rows": len(extracted), "raw_file": raw_file.name})
 
-          # Long-format audit table.
           fieldnames = ["uf_code", "uf", "municipality_id", "municipality", "year", "metric", "value", "unit", "source_url"]
           with (OUT / "ppm_long.csv").open("w", newline="", encoding="utf-8-sig") as f:
               writer = csv.DictWriter(f, fieldnames=fieldnames)
               writer.writeheader()
               writer.writerows(long_rows)
 
-          # Wide analytical table.
           wide = {}
           for row in long_rows:
               key = (row["uf_code"], row["uf"], row["municipality_id"], row["municipality"], row["year"])
@@ -143,6 +142,15 @@ jobs:
           print(json.dumps(manifest, ensure_ascii=False, indent=2))
           PY
           python /tmp/fetch_ibge.py
+
+      - name: Persist normalized audit files temporarily
+        shell: bash
+        run: |
+          git config user.name "IBGE Data Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add ibge_output/ppm_wide.csv ibge_output/ppm_long.csv ibge_output/manifest.json
+          git commit -m "Temporary official IBGE PPM extract" || exit 0
+          git push
 
       - name: Upload official raw and normalized data
         uses: actions/upload-artifact@v4
