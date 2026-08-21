@@ -25,7 +25,7 @@ jobs:
           import urllib.request
           from pathlib import Path
 
-          YEARS = [2020, 2021, 2022, 2023, 2024]
+          YEARS = list(range(2015, 2025))
           UFS = {"50": "MS", "51": "MT", "52": "GO"}
           BASE = "https://servicodados.ibge.gov.br/api/v3/agregados"
           OUT = Path("ibge_output")
@@ -147,6 +147,6 @@ jobs:
       - name: Upload official raw and normalized data
         uses: actions/upload-artifact@v4
         with:
-          name: ibge-ppm-go-mt-ms-2020-2024
+          name: ibge-ppm-go-mt-ms-2015-2024
           path: ibge_output/
           retention-days: 1
