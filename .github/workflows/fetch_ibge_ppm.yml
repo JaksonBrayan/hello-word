@@ -19,6 +19,7 @@ jobs:
         run: |
           cat > /tmp/fetch_ibge.py <<'PY'
           import csv
+          import gzip
           import json
           import time
           import urllib.request
@@ -31,13 +32,16 @@ jobs:
           OUT.mkdir(exist_ok=True)
 
           def get_json(url, attempts=6):
-              headers = {"User-Agent": "Mozilla/5.0 IBGE-PPM-research/1.0", "Accept": "application/json"}
+              headers = {"User-Agent": "Mozilla/5.0 IBGE-PPM-research/1.0", "Accept": "application/json", "Accept-Encoding": "gzip"}
               last_error = None
               for attempt in range(attempts):
                   try:
                       req = urllib.request.Request(url, headers=headers)
                       with urllib.request.urlopen(req, timeout=90) as response:
-                          return json.loads(response.read().decode("utf-8"))
+                          raw = response.read()
+                          if response.headers.get("Content-Encoding", "").lower() == "gzip" or raw[:2] == b"\x1f\x8b":
+                              raw = gzip.decompress(raw)
+                          return json.loads(raw.decode("utf-8"))
                   except Exception as exc:
                       last_error = exc
                       time.sleep(2 ** attempt)
