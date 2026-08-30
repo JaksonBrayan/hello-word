@@ -1,0 +1,1 @@
+Trigger direct SIDRA extraction for Erickson.
