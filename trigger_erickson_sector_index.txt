@@ -1,0 +1,1 @@
+Trigger PMC sector fixed-base index extraction.
