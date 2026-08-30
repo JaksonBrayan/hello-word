@@ -1,0 +1,81 @@
+name: Temporary Erickson IBGE discovery
+
+on:
+  pull_request:
+    paths:
+      - 'trigger_erickson_discovery.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Discover IBGE aggregate metadata
+        shell: bash
+        run: |
+          cat > /tmp/discover.py <<'PY'
+          import json, time, urllib.request, gzip
+          from pathlib import Path
+
+          OUT = Path('erickson_discovery')
+          OUT.mkdir(exist_ok=True)
+          BASE = 'https://servicodados.ibge.gov.br/api/v3/agregados'
+
+          def get_json(url, attempts=5):
+              headers={'User-Agent':'Mozilla/5.0 Erickson-TCC/1.0','Accept':'application/json','Accept-Encoding':'gzip'}
+              err=None
+              for i in range(attempts):
+                  try:
+                      req=urllib.request.Request(url,headers=headers)
+                      with urllib.request.urlopen(req,timeout=90) as r:
+                          raw=r.read()
+                          if r.headers.get('Content-Encoding','').lower()=='gzip' or raw[:2]==b'\x1f\x8b':
+                              raw=gzip.decompress(raw)
+                          return json.loads(raw.decode('utf-8'))
+                  except Exception as exc:
+                      err=exc; time.sleep(2**i)
+              return {'error':str(err),'url':url}
+
+          # Known PMC tables and nearby CEMPRE candidates.
+          ids=[8880,8881,8882,8883]+list(range(9480,9541))
+          summary=[]
+          for tid in ids:
+              url=f'{BASE}/{tid}/metadados'
+              data=get_json(url)
+              (OUT/f'metadata_{tid}.json').write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+              if isinstance(data,dict) and 'error' not in data:
+                  summary.append({
+                      'id':tid,
+                      'nome':data.get('nome'),
+                      'periodicidade':data.get('periodicidade'),
+                      'nivelTerritorial':data.get('nivelTerritorial'),
+                      'variaveis':data.get('variaveis'),
+                      'classificacoes':data.get('classificacoes'),
+                      'periodos':data.get('periodos')
+                  })
+
+          # Full aggregate catalogue filtered for enterprise/local-unit themes.
+          catalog=get_json(BASE)
+          filtered=[]
+          if isinstance(catalog,list):
+              for group in catalog:
+                  for agg in group.get('agregados',[]):
+                      name=(agg.get('nome') or '').lower()
+                      if any(term in name for term in ['unidades locais','cadastro central de empresas','empresas e outras organizações']):
+                          filtered.append(agg)
+          (OUT/'catalog_filtered.json').write_text(json.dumps(filtered,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps({'metadata_found':len(summary),'catalog_matches':len(filtered)},ensure_ascii=False))
+          PY
+          python /tmp/discover.py
+
+      - name: Upload discovery metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: erickson-ibge-discovery
+          path: erickson_discovery/
+          retention-days: 1
