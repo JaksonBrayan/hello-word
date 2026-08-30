@@ -1,0 +1,141 @@
+name: Temporary Erickson official IBGE extraction
+
+on:
+  pull_request:
+    paths:
+      - 'trigger_erickson_full.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Fetch and normalize PMC and CEMPRE
+        shell: bash
+        run: |
+          cat > /tmp/fetch_erickson.py <<'PY'
+          import csv
+          import gzip
+          import json
+          import time
+          import urllib.request
+          from pathlib import Path
+
+          OUT = Path('erickson_output')
+          OUT.mkdir(exist_ok=True)
+          BASE = 'https://servicodados.ibge.gov.br/api/v3/agregados'
+          PERIODS = [f'{y}{m:02d}' for y in range(2020, 2027) for m in range(1, 13) if (y < 2026 or m <= 6)]
+
+          def get_json(url, attempts=7):
+              headers = {
+                  'User-Agent': 'Mozilla/5.0 Erickson-TCC-research/1.0',
+                  'Accept': 'application/json',
+                  'Accept-Encoding': 'gzip'
+              }
+              last = None
+              for attempt in range(attempts):
+                  try:
+                      req = urllib.request.Request(url, headers=headers)
+                      with urllib.request.urlopen(req, timeout=180) as response:
+                          raw = response.read()
+                          if response.headers.get('Content-Encoding', '').lower() == 'gzip' or raw[:2] == b'\x1f\x8b':
+                              raw = gzip.decompress(raw)
+                          return json.loads(raw.decode('utf-8'))
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(30, 2 ** attempt))
+              raise RuntimeError(f'Failed after {attempts} attempts: {url} :: {last}')
+
+          def norm_value(value):
+              if value is None:
+                  return None
+              text = str(value).strip()
+              if text in {'', '-', '..', '...', 'X', 'x'}:
+                  return None
+              try:
+                  return float(text.replace(' ', '').replace(',', '.'))
+              except ValueError:
+                  return None
+
+          def flatten(payload, table_id, source_url):
+              rows = []
+              if not isinstance(payload, list):
+                  return rows
+              for variable_block in payload:
+                  var_id = str(variable_block.get('id', ''))
+                  var_name = variable_block.get('variavel', '')
+                  unit = variable_block.get('unidade', '')
+                  for result in variable_block.get('resultados', []):
+                      class_labels = []
+                      class_ids = []
+                      for cls in result.get('classificacoes', []):
+                          cls_name = cls.get('nome', '')
+                          cat = cls.get('categoria', {}) or {}
+                          for code, label in cat.items():
+                              class_ids.append(f'{cls.get("id", "")}:{code}')
+                              class_labels.append(f'{cls_name}={label}')
+                      for series in result.get('series', []):
+                          loc = series.get('localidade', {}) or {}
+                          level = loc.get('nivel', {}) or {}
+                          loc_id = str(loc.get('id', ''))
+                          loc_name = loc.get('nome', '')
+                          loc_level_id = str(level.get('id', ''))
+                          loc_level_name = level.get('nome', '')
+                          for period, raw_value in (series.get('serie', {}) or {}).items():
+                              rows.append({
+                                  'table_id': str(table_id),
+                                  'variable_id': var_id,
+                                  'variable': var_name,
+                                  'unit': unit,
+                                  'period': str(period),
+                                  'location_level_id': loc_level_id,
+                                  'location_level': loc_level_name,
+                                  'location_id': loc_id,
+                                  'location': loc_name,
+                                  'classification_ids': ' | '.join(class_ids),
+                                  'classification_labels': ' | '.join(class_labels),
+                                  'raw_value': raw_value,
+                                  'value': norm_value(raw_value),
+                                  'source_url': source_url,
+                              })
+              return rows
+
+          specs = [
+              ('pmc_uf', 8880, 7170, '|'.join(PERIODS), 'N3[all]'),
+              ('pmc_sector', 8883, 7170, '|'.join(PERIODS), 'N3[all]'),
+              ('cempre_uf', 9528, 706, '2024', 'N3[all]'),
+              ('cempre_municipality', 9510, 706, '2024', 'N6[all]'),
+          ]
+
+          manifest = {'retrieved_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'sources': []}
+          for name, table_id, variable, periods, localities in specs:
+              url = f'{BASE}/{table_id}/periodos/{periods}/variaveis/{variable}?localidades={localities}'
+              payload = get_json(url)
+              (OUT / f'{name}_raw.json').write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+              rows = flatten(payload, table_id, url)
+              if not rows:
+                  raise RuntimeError(f'No rows extracted for {name}: {url}')
+              fields = list(rows[0].keys())
+              with (OUT / f'{name}.csv').open('w', newline='', encoding='utf-8-sig') as f:
+                  w = csv.DictWriter(f, fieldnames=fields)
+                  w.writeheader(); w.writerows(rows)
+              labels = sorted({r['classification_labels'] for r in rows})
+              (OUT / f'{name}_classification_labels.json').write_text(json.dumps(labels, ensure_ascii=False, indent=2), encoding='utf-8')
+              manifest['sources'].append({'name': name, 'table_id': table_id, 'variable': variable, 'rows': len(rows), 'url': url})
+              print(name, len(rows))
+
+          (OUT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/fetch_erickson.py
+
+      - name: Upload official data
+        uses: actions/upload-artifact@v4
+        with:
+          name: erickson-official-ibge-data
+          path: erickson_output/
+          retention-days: 1
