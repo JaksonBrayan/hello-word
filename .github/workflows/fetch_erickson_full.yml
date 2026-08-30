@@ -12,7 +12,7 @@ permissions:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Fetch and normalize PMC and CEMPRE
         shell: bash
@@ -22,17 +22,18 @@ jobs:
           import gzip
           import json
           import time
+          import urllib.parse
           import urllib.request
           from pathlib import Path
 
-          OUT = Path('erickson_output')
+          OUT = Path('erickson_output_v2')
           OUT.mkdir(exist_ok=True)
           BASE = 'https://servicodados.ibge.gov.br/api/v3/agregados'
           PERIODS = [f'{y}{m:02d}' for y in range(2020, 2027) for m in range(1, 13) if (y < 2026 or m <= 6)]
 
           def get_json(url, attempts=7):
               headers = {
-                  'User-Agent': 'Mozilla/5.0 Erickson-TCC-research/1.0',
+                  'User-Agent': 'Mozilla/5.0 Erickson-TCC-research/2.0',
                   'Accept': 'application/json',
                   'Accept-Encoding': 'gzip'
               }
@@ -40,7 +41,7 @@ jobs:
               for attempt in range(attempts):
                   try:
                       req = urllib.request.Request(url, headers=headers)
-                      with urllib.request.urlopen(req, timeout=180) as response:
+                      with urllib.request.urlopen(req, timeout=240) as response:
                           raw = response.read()
                           if response.headers.get('Content-Encoding', '').lower() == 'gzip' or raw[:2] == b'\x1f\x8b':
                               raw = gzip.decompress(raw)
@@ -81,10 +82,6 @@ jobs:
                       for series in result.get('series', []):
                           loc = series.get('localidade', {}) or {}
                           level = loc.get('nivel', {}) or {}
-                          loc_id = str(loc.get('id', ''))
-                          loc_name = loc.get('nome', '')
-                          loc_level_id = str(level.get('id', ''))
-                          loc_level_name = level.get('nome', '')
                           for period, raw_value in (series.get('serie', {}) or {}).items():
                               rows.append({
                                   'table_id': str(table_id),
@@ -92,10 +89,10 @@ jobs:
                                   'variable': var_name,
                                   'unit': unit,
                                   'period': str(period),
-                                  'location_level_id': loc_level_id,
-                                  'location_level': loc_level_name,
-                                  'location_id': loc_id,
-                                  'location': loc_name,
+                                  'location_level_id': str(level.get('id', '')),
+                                  'location_level': level.get('nome', ''),
+                                  'location_id': str(loc.get('id', '')),
+                                  'location': loc.get('nome', ''),
                                   'classification_ids': ' | '.join(class_ids),
                                   'classification_labels': ' | '.join(class_labels),
                                   'raw_value': raw_value,
@@ -105,28 +102,51 @@ jobs:
               return rows
 
           specs = [
-              ('pmc_uf', 8880, 7170, '|'.join(PERIODS), 'N3[all]'),
-              ('pmc_sector', 8883, 7170, '|'.join(PERIODS), 'N3[all]'),
-              ('cempre_uf', 9528, 706, '2024', 'N3[all]'),
-              ('cempre_municipality', 9510, 706, '2024', 'N6[all]'),
+              {
+                  'name': 'pmc_uf', 'table': 8880, 'variable': 7170,
+                  'periods': '|'.join(PERIODS), 'localities': 'N3[all]',
+                  'classification': '11046[56734]'
+              },
+              {
+                  'name': 'pmc_sector', 'table': 8883, 'variable': 7170,
+                  'periods': '|'.join(PERIODS), 'localities': 'N3[all]',
+                  'classification': '11046[56736]|85[all]'
+              },
+              {
+                  'name': 'cempre_uf', 'table': 9528, 'variable': 706,
+                  'periods': '2024', 'localities': 'N3[all]',
+                  'classification': '12762[all]'
+              },
+              {
+                  'name': 'cempre_municipality', 'table': 9510, 'variable': 706,
+                  'periods': '2024', 'localities': 'N6[all]',
+                  'classification': '12762[all]'
+              },
           ]
 
           manifest = {'retrieved_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'sources': []}
-          for name, table_id, variable, periods, localities in specs:
-              url = f'{BASE}/{table_id}/periodos/{periods}/variaveis/{variable}?localidades={localities}'
+          for spec in specs:
+              url = (
+                  f"{BASE}/{spec['table']}/periodos/{spec['periods']}/variaveis/{spec['variable']}"
+                  f"?localidades={spec['localities']}&classificacao={spec['classification']}"
+              )
               payload = get_json(url)
-              (OUT / f'{name}_raw.json').write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
-              rows = flatten(payload, table_id, url)
-              if not rows:
-                  raise RuntimeError(f'No rows extracted for {name}: {url}')
+              (OUT / f"{spec['name']}_raw.json").write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+              rows = flatten(payload, spec['table'], url)
+              non_null = sum(r['value'] is not None for r in rows)
+              if not rows or non_null == 0:
+                  raise RuntimeError(f"No numeric rows extracted for {spec['name']}: {url}")
               fields = list(rows[0].keys())
-              with (OUT / f'{name}.csv').open('w', newline='', encoding='utf-8-sig') as f:
+              with (OUT / f"{spec['name']}.csv").open('w', newline='', encoding='utf-8-sig') as f:
                   w = csv.DictWriter(f, fieldnames=fields)
                   w.writeheader(); w.writerows(rows)
               labels = sorted({r['classification_labels'] for r in rows})
-              (OUT / f'{name}_classification_labels.json').write_text(json.dumps(labels, ensure_ascii=False, indent=2), encoding='utf-8')
-              manifest['sources'].append({'name': name, 'table_id': table_id, 'variable': variable, 'rows': len(rows), 'url': url})
-              print(name, len(rows))
+              (OUT / f"{spec['name']}_classification_labels.json").write_text(json.dumps(labels, ensure_ascii=False, indent=2), encoding='utf-8')
+              manifest['sources'].append({
+                  'name': spec['name'], 'table_id': spec['table'], 'variable': spec['variable'],
+                  'rows': len(rows), 'numeric_rows': non_null, 'url': url
+              })
+              print(spec['name'], len(rows), non_null)
 
           (OUT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
           print(json.dumps(manifest, ensure_ascii=False, indent=2))
@@ -136,6 +156,6 @@ jobs:
       - name: Upload official data
         uses: actions/upload-artifact@v4
         with:
-          name: erickson-official-ibge-data
-          path: erickson_output/
+          name: erickson-official-ibge-data-v2
+          path: erickson_output_v2/
           retention-days: 1
