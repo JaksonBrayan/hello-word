@@ -1,0 +1,139 @@
+name: Temporary Erickson curated IBGE extraction
+
+on:
+  pull_request:
+    paths:
+      - 'trigger_erickson_curated.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Fetch curated official PMC and CEMPRE data
+        shell: bash
+        run: |
+          cat > /tmp/fetch_curated.py <<'PY'
+          import csv, gzip, json, time, urllib.request
+          from pathlib import Path
+
+          OUT=Path('erickson_curated'); OUT.mkdir(exist_ok=True)
+          BASE='https://servicodados.ibge.gov.br/api/v3/agregados'
+          PERIODS=[f'{y}{m:02d}' for y in range(2020,2027) for m in range(1,13) if y<2026 or m<=6]
+          ACTS={
+            90671:'Combustíveis e lubrificantes',
+            90672:'Hipermercados, supermercados, produtos alimentícios, bebidas e fumo',
+            103154:'Hipermercados e supermercados',
+            90673:'Tecidos, vestuário e calçados',
+            2759:'Móveis e eletrodomésticos',
+            31555:'Móveis',
+            31556:'Eletrodomésticos',
+            103155:'Artigos farmacêuticos, médicos, ortopédicos, de perfumaria e cosméticos',
+            103156:'Livros, jornais, revistas e papelaria',
+            103157:'Equipamentos e materiais para escritório, informática e comunicação',
+            103158:'Outros artigos de uso pessoal e doméstico',
+            103159:'Veículos, motocicletas, partes e peças',
+            2762:'Material de construção',
+            56741:'Atacado especializado em produtos alimentícios, bebidas e fumo',
+          }
+          DIVS={
+            116911:'10 Fabricação de produtos alimentícios',
+            116952:'11 Fabricação de bebidas',
+            116985:'14 Confecção de artigos do vestuário e acessórios',
+            116994:'15 Preparação de couros e fabricação de artefatos de couro, artigos para viagem e calçados',
+            117048:'20 Fabricação de produtos químicos',
+            117082:'21 Fabricação de produtos farmoquímicos e farmacêuticos',
+            117159:'26 Fabricação de equipamentos de informática, produtos eletrônicos e ópticos',
+            117179:'27 Fabricação de máquinas, aparelhos e materiais elétricos',
+            117261:'31 Fabricação de móveis',
+            117270:'32 Fabricação de produtos diversos',
+            117376:'46 Comércio por atacado, exceto veículos automotores e motocicletas',
+            117438:'47 Comércio varejista',
+          }
+          headers={'User-Agent':'Mozilla/5.0 Erickson-TCC-research/4.0','Accept':'application/json','Accept-Encoding':'gzip'}
+          def get(url,attempts=6):
+            last=None
+            for i in range(attempts):
+              try:
+                req=urllib.request.Request(url,headers=headers)
+                with urllib.request.urlopen(req,timeout=180) as r:
+                  raw=r.read()
+                  if r.headers.get('Content-Encoding','').lower()=='gzip' or raw[:2]==b'\x1f\x8b': raw=gzip.decompress(raw)
+                  return json.loads(raw.decode('utf-8'))
+              except Exception as exc:
+                last=exc; time.sleep(min(20,2**i))
+            raise RuntimeError(f'{url} :: {last}')
+          def num(v):
+            s=str(v).strip()
+            if s in {'','-','..','...','X','x'}: return None
+            try:return float(s.replace(' ','').replace(',','.'))
+            except:return None
+          def flatten(payload,source_name,extra,url):
+            rows=[]
+            for vb in payload if isinstance(payload,list) else []:
+              for result in vb.get('resultados',[]):
+                labels=[]; ids=[]
+                for cls in result.get('classificacoes',[]):
+                  for cid,label in (cls.get('categoria',{}) or {}).items():
+                    ids.append(f"{cls.get('id')}:{cid}"); labels.append(f"{cls.get('nome')}={label}")
+                for series in result.get('series',[]):
+                  loc=series.get('localidade',{}) or {}; level=loc.get('nivel',{}) or {}
+                  for period,raw in (series.get('serie',{}) or {}).items():
+                    row={
+                      'source_name':source_name,'table_id':str(vb.get('id','')),'variable':vb.get('variavel',''),'unit':vb.get('unidade',''),
+                      'period':str(period),'location_level_id':str(level.get('id','')),'location_level':level.get('nome',''),
+                      'location_id':str(loc.get('id','')),'location':loc.get('nome',''),
+                      'classification_ids':' | '.join(ids),'classification_labels':' | '.join(labels),
+                      'raw_value':raw,'value':num(raw),'source_url':url,
+                    }
+                    row.update(extra); rows.append(row)
+            return rows
+          def write(name,rows):
+            if not rows: raise RuntimeError(f'No rows: {name}')
+            fields=list(rows[0])
+            with (OUT/f'{name}.csv').open('w',newline='',encoding='utf-8-sig') as f:
+              w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(rows)
+            print(name,len(rows),sum(r['value'] is not None for r in rows))
+
+          periods='|'.join(PERIODS)
+          # Aggregate retail index, 27 UFs.
+          url=f'{BASE}/8880/periodos/{periods}/variaveis/7170?localidades=N3[all]&classificacao=11046[56734]'
+          pmc_uf=flatten(get(url),'PMC_UF',{'activity_id':'TOTAL','activity':'Comércio varejista'},url)
+          write('pmc_uf',pmc_uf)
+
+          # Activity-level retail indices, 12 UFs. Query each activity with both index types; keep labels for audit.
+          pmc_sector=[]
+          for aid,aname in ACTS.items():
+            url=f'{BASE}/8883/periodos/{periods}/variaveis/7170?localidades=N3[all]&classificacao=11046[all]|85[{aid}]'
+            rows=flatten(get(url),'PMC_SETOR',{'activity_id':str(aid),'activity':aname},url)
+            pmc_sector.extend(rows)
+          write('pmc_sector',pmc_sector)
+
+          # Current business scale by selected CNAE divisions at UF and municipality level.
+          cempre_uf=[]; cempre_mun=[]
+          for cid,cname in DIVS.items():
+            url=f'{BASE}/9528/periodos/2024/variaveis/706?localidades=N3[all]&classificacao=12762[{cid}]'
+            cempre_uf.extend(flatten(get(url),'CEMPRE_UF',{'cnae_category_id':str(cid),'cnae_division':cname},url))
+            url=f'{BASE}/9510/periodos/2024/variaveis/706?localidades=N6[all]&classificacao=12762[{cid}]'
+            cempre_mun.extend(flatten(get(url),'CEMPRE_MUNICIPIO',{'cnae_category_id':str(cid),'cnae_division':cname},url))
+          write('cempre_uf',cempre_uf); write('cempre_municipality',cempre_mun)
+
+          manifest={
+            'retrieved_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+            'period_start':PERIODS[0],'period_end':PERIODS[-1],
+            'activities':ACTS,'cnae_divisions':DIVS,
+            'rows':{'pmc_uf':len(pmc_uf),'pmc_sector':len(pmc_sector),'cempre_uf':len(cempre_uf),'cempre_municipality':len(cempre_mun)},
+          }
+          (OUT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          python /tmp/fetch_curated.py
+      - name: Upload curated official data
+        uses: actions/upload-artifact@v4
+        with:
+          name: erickson-curated-official-data
+          path: erickson_curated/
+          retention-days: 1
