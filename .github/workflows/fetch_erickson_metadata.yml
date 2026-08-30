@@ -1,0 +1,41 @@
+name: Temporary Erickson targeted IBGE metadata
+
+on:
+  pull_request:
+    paths:
+      - 'trigger_erickson_metadata.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Fetch targeted metadata
+        shell: bash
+        run: |
+          mkdir -p erickson_metadata
+          python - <<'PY'
+          import gzip, json, time, urllib.request
+          from pathlib import Path
+          out=Path('erickson_metadata')
+          headers={'User-Agent':'Mozilla/5.0 Erickson-TCC/1.0','Accept':'application/json','Accept-Encoding':'gzip'}
+          for tid in [8880,8883,9510,9528]:
+              url=f'https://servicodados.ibge.gov.br/api/v3/agregados/{tid}/metadados'
+              req=urllib.request.Request(url,headers=headers)
+              with urllib.request.urlopen(req,timeout=120) as r:
+                  raw=r.read()
+                  if r.headers.get('Content-Encoding','').lower()=='gzip' or raw[:2]==b'\x1f\x8b': raw=gzip.decompress(raw)
+                  data=json.loads(raw.decode('utf-8'))
+              (out/f'metadata_{tid}.json').write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+              print(tid, data.get('nome'), [(c.get('id'),c.get('nome'),len(c.get('categorias',[]))) for c in data.get('classificacoes',[])])
+          PY
+      - name: Upload metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: erickson-targeted-metadata
+          path: erickson_metadata/
+          retention-days: 1
