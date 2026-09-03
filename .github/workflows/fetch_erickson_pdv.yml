@@ -1,0 +1,263 @@
+name: Temporary Erickson PDV official extraction
+
+on:
+  pull_request:
+    paths:
+      - 'trigger_erickson_pdv.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Fetch official PMC and CEMPRE data
+        shell: bash
+        run: |
+          cat > /tmp/fetch_erickson_pdv.py <<'PY'
+          import csv
+          import gzip
+          import json
+          import re
+          import time
+          import unicodedata
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          OUT = Path('erickson_pdv_output')
+          OUT.mkdir(exist_ok=True)
+          AGG = 'https://servicodados.ibge.gov.br/api/v3/agregados'
+
+          UF_CODES = {
+              '11':'RO','12':'AC','13':'AM','14':'RR','15':'PA','16':'AP','17':'TO',
+              '21':'MA','22':'PI','23':'CE','24':'RN','25':'PB','26':'PE','27':'AL','28':'SE','29':'BA',
+              '31':'MG','32':'ES','33':'RJ','35':'SP','41':'PR','42':'SC','43':'RS',
+              '50':'MS','51':'MT','52':'GO','53':'DF'
+          }
+
+          def norm(text):
+              text = unicodedata.normalize('NFKD', str(text)).encode('ascii','ignore').decode('ascii')
+              return re.sub(r'\s+', ' ', text).strip().lower()
+
+          def get_json(url, attempts=7, timeout=240):
+              headers = {
+                  'User-Agent':'Mozilla/5.0 Erickson-PDV-TCC/1.0',
+                  'Accept':'application/json',
+                  'Accept-Encoding':'gzip'
+              }
+              last = None
+              for attempt in range(attempts):
+                  try:
+                      req = urllib.request.Request(url, headers=headers)
+                      with urllib.request.urlopen(req, timeout=timeout) as response:
+                          raw = response.read()
+                          if response.headers.get('Content-Encoding','').lower() == 'gzip' or raw[:2] == b'\x1f\x8b':
+                              raw = gzip.decompress(raw)
+                          return json.loads(raw.decode('utf-8'))
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(30, 2 ** attempt))
+              raise RuntimeError(f'Failed after {attempts} attempts: {url} :: {last}')
+
+          def find_variable(meta, terms):
+              for var in meta.get('variaveis', []):
+                  name = norm(var.get('nome',''))
+                  if all(term in name for term in terms):
+                      return str(var['id']), var.get('nome','')
+              return None, None
+
+          def find_category(meta, starts=None, contains=None):
+              for cls in meta.get('classificacoes', []):
+                  for cat in cls.get('categorias', []):
+                      label = cat.get('nome','')
+                      n = norm(label)
+                      if starts and n.startswith(norm(starts)):
+                          return str(cls['id']), str(cat['id']), label, cls.get('nome','')
+                      if contains and all(norm(term) in n for term in contains):
+                          return str(cls['id']), str(cat['id']), label, cls.get('nome','')
+              return None, None, None, None
+
+          def flatten(payload, source_name, source_url):
+              rows = []
+              if not isinstance(payload, list):
+                  return rows
+              for variable_block in payload:
+                  var_id = str(variable_block.get('id',''))
+                  var_name = variable_block.get('variavel','')
+                  unit = variable_block.get('unidade','')
+                  for result in variable_block.get('resultados', []):
+                      class_ids = []
+                      class_labels = []
+                      for cls in result.get('classificacoes', []):
+                          cls_id = str(cls.get('id',''))
+                          cls_name = cls.get('nome','')
+                          for code, label in (cls.get('categoria',{}) or {}).items():
+                              class_ids.append(f'{cls_id}:{code}')
+                              class_labels.append(f'{cls_name}={label}')
+                      for series in result.get('series', []):
+                          loc = series.get('localidade',{}) or {}
+                          level = loc.get('nivel',{}) or {}
+                          for period, raw_value in (series.get('serie',{}) or {}).items():
+                              text = str(raw_value).strip()
+                              value = None
+                              if text not in {'','-','..','...','X','x'}:
+                                  try:
+                                      value = float(text.replace(' ','').replace(',','.'))
+                                  except ValueError:
+                                      value = None
+                              rows.append({
+                                  'source_name':source_name,
+                                  'variable_id':var_id,
+                                  'variable':var_name,
+                                  'unit':unit,
+                                  'period':str(period),
+                                  'location_level_id':str(level.get('id','')),
+                                  'location_level':level.get('nome',''),
+                                  'location_id':str(loc.get('id','')),
+                                  'location':loc.get('nome',''),
+                                  'classification_ids':' | '.join(class_ids),
+                                  'classification_labels':' | '.join(class_labels),
+                                  'raw_value':raw_value,
+                                  'value':value,
+                                  'source_url':source_url,
+                              })
+              return rows
+
+          def write_csv(path, rows):
+              if not rows:
+                  path.write_text('', encoding='utf-8')
+                  return
+              with path.open('w', newline='', encoding='utf-8-sig') as f:
+                  w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                  w.writeheader(); w.writerows(rows)
+
+          # ---------------- Metadata ----------------
+          meta9528 = get_json(f'{AGG}/9528/metadados')
+          meta8883 = get_json(f'{AGG}/8883/metadados')
+          (OUT/'meta_9528.json').write_text(json.dumps(meta9528, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT/'meta_8883.json').write_text(json.dumps(meta8883, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          units_var, units_name = find_variable(meta9528, ['numero','unidades locais'])
+          people_var, people_name = find_variable(meta9528, ['pessoal ocupado total'])
+          if not units_var:
+              raise RuntimeError('Variable Número de unidades locais not found in table 9528 metadata')
+
+          class_cls, class_cat, class_label, class_name = find_category(meta9528, starts='47.11-3')
+          if not class_cat:
+              class_cls, class_cat, class_label, class_name = find_category(meta9528, contains=['hipermercados','supermercados'])
+          div_cls, div_cat, div_label, div_name = find_category(meta9528, starts='47 comercio varejista')
+          if not div_cat:
+              div_cls, div_cat, div_label, div_name = find_category(meta9528, contains=['47','comercio varejista'])
+          if not class_cat:
+              raise RuntimeError('Class 47.11-3 not found in table 9528 metadata')
+
+          activity_cls, activity_cat, activity_label, activity_name = find_category(meta8883, contains=['hipermercados','supermercados'])
+          index_var, index_name = find_variable(meta8883, ['numero-indice'])
+          if not index_var:
+              index_var, index_name = find_variable(meta8883, ['indice','volume'])
+          if not activity_cat or not index_var:
+              raise RuntimeError('PMC activity or index variable not found in table 8883 metadata')
+
+          # Type classification is retrieved as all categories; volume rows are filtered downstream.
+          other_classes = [str(cls['id']) for cls in meta8883.get('classificacoes',[]) if str(cls['id']) != activity_cls]
+          type_cls = other_classes[0] if other_classes else None
+
+          summary = {
+              '9528': {
+                  'units_variable':{'id':units_var,'name':units_name},
+                  'people_variable':{'id':people_var,'name':people_name},
+                  'activity_classification':{'id':class_cls,'name':class_name},
+                  'class_47113':{'id':class_cat,'label':class_label},
+                  'division_47':{'classification_id':div_cls,'id':div_cat,'label':div_label},
+                  'territorial_levels':meta9528.get('nivelTerritorial')
+              },
+              '8883': {
+                  'index_variable':{'id':index_var,'name':index_name},
+                  'activity_classification':{'id':activity_cls,'name':activity_name},
+                  'activity_hyper_super':{'id':activity_cat,'label':activity_label},
+                  'type_classification_id':type_cls,
+                  'territorial_levels':meta8883.get('nivelTerritorial')
+              }
+          }
+          (OUT/'metadata_summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          # ---------------- CEMPRE State ----------------
+          var_path = units_var if not people_var else f'{units_var}|{people_var}'
+          class_url_state = f'{AGG}/9528/periodos/2024/variaveis/{var_path}?localidades=N3[all]&classificacao={class_cls}[{class_cat}]'
+          state_class = flatten(get_json(class_url_state), 'CEMPRE_CLASS_47113_UF', class_url_state)
+          write_csv(OUT/'cempre_uf_class_47113.csv', state_class)
+
+          state_div = []
+          if div_cat:
+              div_url_state = f'{AGG}/9528/periodos/2024/variaveis/{var_path}?localidades=N3[all]&classificacao={div_cls}[{div_cat}]'
+              state_div = flatten(get_json(div_url_state), 'CEMPRE_DIVISION_47_UF', div_url_state)
+              write_csv(OUT/'cempre_uf_division_47.csv', state_div)
+
+          # ---------------- CEMPRE Municipality (all states, one request per UF) ----------------
+          municipal_class = []
+          municipal_div = []
+          municipal_errors = []
+          for uf_code, uf in UF_CODES.items():
+              try:
+                  url = f'{AGG}/9528/periodos/2024/variaveis/{var_path}?localidades=N6[N3[{uf_code}]]&classificacao={class_cls}[{class_cat}]'
+                  rows = flatten(get_json(url), 'CEMPRE_CLASS_47113_MUNICIPIO', url)
+                  for row in rows:
+                      row['uf_code'] = uf_code
+                      row['uf'] = uf
+                  municipal_class.extend(rows)
+              except Exception as exc:
+                  municipal_errors.append({'uf':uf,'type':'class','error':str(exc)})
+              if div_cat:
+                  try:
+                      url = f'{AGG}/9528/periodos/2024/variaveis/{var_path}?localidades=N6[N3[{uf_code}]]&classificacao={div_cls}[{div_cat}]'
+                      rows = flatten(get_json(url), 'CEMPRE_DIVISION_47_MUNICIPIO', url)
+                      for row in rows:
+                          row['uf_code'] = uf_code
+                          row['uf'] = uf
+                      municipal_div.extend(rows)
+                  except Exception as exc:
+                      municipal_errors.append({'uf':uf,'type':'division','error':str(exc)})
+          write_csv(OUT/'cempre_municipality_class_47113.csv', municipal_class)
+          write_csv(OUT/'cempre_municipality_division_47.csv', municipal_div)
+          (OUT/'cempre_municipal_errors.json').write_text(json.dumps(municipal_errors, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          # ---------------- PMC channel, 2015-01 to 2026-06 ----------------
+          periods = '|'.join([f'{y}{m:02d}' for y in range(2015,2027) for m in range(1,13) if y < 2026 or m <= 6])
+          locations = ['N1[all]','N3[all]']
+          pmc_rows = []
+          for loc in locations:
+              class_filter = f'{activity_cls}[{activity_cat}]'
+              if type_cls:
+                  class_filter = f'{type_cls}[all]|{class_filter}'
+              url = f'{AGG}/8883/periodos/{periods}/variaveis/{index_var}?localidades={loc}&classificacao={class_filter}'
+              rows = flatten(get_json(url), 'PMC_HIPER_SUPER', url)
+              pmc_rows.extend(rows)
+          write_csv(OUT/'pmc_hyper_super_2015_2026.csv', pmc_rows)
+
+          manifest = {
+              'retrieved_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+              'rows':{
+                  'cempre_uf_class_47113':len(state_class),
+                  'cempre_uf_division_47':len(state_div),
+                  'cempre_municipality_class_47113':len(municipal_class),
+                  'cempre_municipality_division_47':len(municipal_div),
+                  'pmc_hyper_super':len(pmc_rows),
+              },
+              'metadata_summary':summary,
+              'municipal_errors':municipal_errors,
+          }
+          (OUT/'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/fetch_erickson_pdv.py
+
+      - name: Upload official data
+        uses: actions/upload-artifact@v4
+        with:
+          name: erickson-pdv-official-ibge
+          path: erickson_pdv_output/
+          retention-days: 1
